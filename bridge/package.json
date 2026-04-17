@@ -1,0 +1,18 @@
+{
+  "name": "agent-bridge",
+  "version": "1.0.0",
+  "description": "Bridge server connecting a mobile client to a persistent Claude Code session via HTTP + WebSocket.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "ws": "^8.20.0"
+  }
+}

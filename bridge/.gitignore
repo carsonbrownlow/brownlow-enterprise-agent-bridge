@@ -1,0 +1,4 @@
+node_modules/
+session_logs.jsonl
+*.bak.*
+package-lock.json
