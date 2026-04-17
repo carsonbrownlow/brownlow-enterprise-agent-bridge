@@ -9,9 +9,10 @@
 #   4. Ensures ~/.claude/settings.json has defaultMode=bypassPermissions (merged,
 #      not overwritten)
 #   5. Starts the bridge under pm2 as 'agent-bridge' and saves the pm2 state
-#   6. Installs a launchd plist so the bridge resurrects on boot
-#   7. Prints the bridge URL (tailscale ip -4), the claude auth reminder, and
-#      the BE-Agent app instructions
+#   6. Auto-runs `pm2 startup` for boot persistence (evals the sudo env
+#      line pm2 prints — no manual copy-paste needed)
+#   7. Probes /health and prints bridge URL + status (ready / starting /
+#      down) + the claude auth reminder and BE-Agent app instructions
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main/install.sh | bash
@@ -21,8 +22,6 @@ set -euo pipefail
 REPO_RAW="https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main"
 INSTALL_DIR="$HOME/agent-bridge"
 PM2_NAME="agent-bridge"
-PLIST_LABEL="com.brownlow.agent-bridge"
-PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 NVM_DIR="$HOME/.nvm"
 
 say() { printf "\033[1;34m[agent-bridge]\033[0m %s\n" "$*"; }
@@ -129,51 +128,28 @@ pm2 start "$INSTALL_DIR/index.js" --name "$PM2_NAME" --cwd "$INSTALL_DIR"
 pm2 save
 
 # ---------------------------------------------------------------------------
-# 6. launchd plist for boot persistence
+# 6. Boot persistence via `pm2 startup` (installs a launchd plist under
+#    ~/Library/LaunchAgents/com.pm2.<user>.plist). Auto-eval the sudo env
+#    line pm2 prints so the user does not have to copy-paste it.
 # ---------------------------------------------------------------------------
-say "Installing launchd plist at $PLIST_PATH"
-mkdir -p "$HOME/Library/LaunchAgents"
+say "Registering pm2 for boot persistence"
+PM2_STARTUP_OUTPUT="$(pm2 startup 2>&1 || true)"
+PM2_STARTUP_CMD="$(printf '%s\n' "$PM2_STARTUP_OUTPUT" | grep -E '^[[:space:]]*sudo env' | tail -n1 | sed 's/^[[:space:]]*//')"
 
-NODE_BIN="$(command -v node)"
-NODE_BIN_DIR="$(dirname "$NODE_BIN")"
-PM2_BIN="$(command -v pm2)"
-
-cat > "$PLIST_PATH" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${PLIST_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${PM2_BIN}</string>
-    <string>resurrect</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>${NODE_BIN_DIR}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-    <key>HOME</key>
-    <string>${HOME}</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <false/>
-  <key>StandardOutPath</key>
-  <string>${INSTALL_DIR}/launchd.out.log</string>
-  <key>StandardErrorPath</key>
-  <string>${INSTALL_DIR}/launchd.err.log</string>
-</dict>
-</plist>
-PLIST
-
-launchctl unload "$PLIST_PATH" >/dev/null 2>&1 || true
-launchctl load "$PLIST_PATH"
+if [ -n "$PM2_STARTUP_CMD" ]; then
+  say "Auto-running: $PM2_STARTUP_CMD"
+  if ! eval "$PM2_STARTUP_CMD"; then
+    say "WARN: pm2 startup eval exited non-zero. If prompted for a password above and you skipped it, re-run: $PM2_STARTUP_CMD"
+  fi
+  pm2 save
+else
+  say "pm2 startup did not emit a sudo env line. Output was:"
+  printf '%s\n' "$PM2_STARTUP_OUTPUT"
+  say "You may need to run \`pm2 startup\` manually and follow the printed instructions."
+fi
 
 # ---------------------------------------------------------------------------
-# 7. Final instructions
+# 7. Final instructions + health probe
 # ---------------------------------------------------------------------------
 TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
 if [ -z "$TS_IP" ]; then
@@ -184,6 +160,23 @@ else
   TS_NOTE=""
 fi
 
+# Give pm2 a moment, then probe /health and categorize the response into
+# one of three states: session ready / bridge up but session starting /
+# bridge not responding.
+sleep 2
+HEALTH="$(curl -fsS --max-time 3 http://127.0.0.1:3456/health 2>/dev/null || true)"
+
+if [ -z "$HEALTH" ]; then
+  HEALTH_STATE="DOWN"
+  HEALTH_MSG="⚠️  Bridge is not responding on http://127.0.0.1:3456/health. Check pm2 logs agent-bridge."
+elif printf '%s' "$HEALTH" | grep -q '"session_ready":true'; then
+  HEALTH_STATE="READY"
+  HEALTH_MSG="✅ Bridge is live and the Claude session is ready."
+else
+  HEALTH_STATE="STARTING"
+  HEALTH_MSG="⏳ Bridge is up but the Claude session is still starting. Run 'claude' once to authenticate if you have not already, then pm2 restart agent-bridge."
+fi
+
 cat <<EOF
 
 ────────────────────────────────────────────────────────────
@@ -191,8 +184,12 @@ cat <<EOF
 
  Bridge URL:  ${BRIDGE_URL}
 ${TS_NOTE}
+ Status:      ${HEALTH_STATE}
+ ${HEALTH_MSG}
+
  Next:
-   1. Run 'claude' once in this terminal to authenticate via browser.
+   1. If you have not yet authenticated, run 'claude' in this terminal
+      to complete the browser login.
    2. Open the BE-Agent app and paste the bridge URL above into
       the connection field.
 ────────────────────────────────────────────────────────────

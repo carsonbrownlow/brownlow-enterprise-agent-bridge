@@ -1,268 +1,193 @@
-# Brownlow Enterprise - Agent Bridge installer (Windows)
+# Brownlow Enterprise - Agent Bridge installer (Windows -> WSL2)
 #
-# Does exactly this, in order:
-#   1. Install Node.js LTS via winget if not present
-#   1b. Install Git (Git Bash) via winget if not present
-#   2. Install Claude Code CLI via `npm install -g @anthropic-ai/claude-code`
-#   3. Download bridge/index.js to %USERPROFILE%\agent-bridge and install express + ws
-#   4. Merge defaultMode=bypassPermissions into %USERPROFILE%\.claude\settings.json
-#   5. Write ecosystem.config.js (with CLAUDE_PATH baked in) and start the
-#      bridge under pm2 as 'agent-bridge', then pm2 save
-#   6. Register a Task Scheduler task that runs `pm2 resurrect` at login
-#   7. Print the Tailscale bridge URL and next-step instructions
+# Claude Code's stream-json protocol is not supported natively on Windows,
+# so every Windows deployment runs the bridge inside WSL2 Ubuntu. This
+# script installs WSL Ubuntu if needed, runs the Linux install.sh inside
+# WSL, then sets up Windows-side netsh portproxy + firewall + a scheduled
+# task so ws://<host>:3456 on Windows reaches the bridge inside WSL.
+#
+# Flow:
+#   1. If WSL Ubuntu is not installed: wsl --install -d Ubuntu, tell the
+#      user to restart and re-run the script.
+#   2. Run install.sh inside WSL Ubuntu via curl | bash.
+#   3. Resolve the WSL IP (hostname -I inside Ubuntu).
+#   4. Self-elevate to admin if needed (netsh + schtasks require admin).
+#   5. netsh portproxy 0.0.0.0:3456 -> <WSL-IP>:3456 + firewall rule.
+#   6. Scheduled task AgentBridgePortForward re-applies the portproxy at
+#      every logon (WSL IP changes on reboot).
+#   7. Print bridge URL (tailscale ip -4 inside WSL) and next steps.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main/install-windows.ps1 | iex"
 
 $ErrorActionPreference = 'Stop'
 
-# Set execution policy for the current user so npm-shim .ps1 wrappers
-# (pm2.ps1, claude.ps1, etc.) are allowed to run. Without this, pm2 and
-# other globally-installed tools fail with "running scripts is disabled
-# on this system" on machines that still have the default Restricted
-# policy. CurrentUser scope does not require admin.
 try {
     Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
 } catch {
     Write-Host "[agent-bridge] WARN: could not set execution policy: $_" -ForegroundColor Yellow
 }
 
-$RepoRaw     = 'https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main'
-$InstallDir  = Join-Path $env:USERPROFILE 'agent-bridge'
-$Pm2Name     = 'agent-bridge'
-$TaskName    = 'AgentBridgeResurrect'
-$SettingsDir = Join-Path $env:USERPROFILE '.claude'
-$Settings    = Join-Path $SettingsDir 'settings.json'
+$Distro         = 'Ubuntu'
+$BridgePort     = 3456
+$TaskName       = 'AgentBridgePortForward'
+$FirewallRule   = 'Agent Bridge 3456'
+$InstallShUrl   = 'https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main/install.sh'
 
-function Say($msg) { Write-Host "[agent-bridge] $msg" -ForegroundColor Cyan }
-function Die($msg) { Write-Host "[agent-bridge] $msg" -ForegroundColor Red; exit 1 }
+function Say($msg)  { Write-Host "[agent-bridge] $msg" -ForegroundColor Cyan }
+function Warn($msg) { Write-Host "[agent-bridge] $msg" -ForegroundColor Yellow }
+function Die($msg)  { Write-Host "[agent-bridge] $msg" -ForegroundColor Red; exit 1 }
 
-function Refresh-Path {
-    $machine = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
-    $user    = [System.Environment]::GetEnvironmentVariable('Path', 'User')
-    $env:Path = "$machine;$user"
+function Test-Admin {
+    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = New-Object System.Security.Principal.WindowsPrincipal($id)
+    return $p.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# Run a native command and swallow any non-zero exit / stderr noise.
-# Used for pm2 delete and schtasks /delete where "not found" is fine.
-function Invoke-IgnoreFail {
-    param([scriptblock]$Script)
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'SilentlyContinue'
-    try { & $Script 2>&1 | Out-Null } catch { }
-    $global:LASTEXITCODE = 0
-    $ErrorActionPreference = $prev
-}
-
-# ---------------------------------------------------------------------------
-# 1. Node.js LTS
-# ---------------------------------------------------------------------------
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    Say 'Installing Node.js LTS via winget'
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Die 'winget is not available. Install App Installer from the Microsoft Store, then re-run this script.'
-    }
-    winget install --id OpenJS.NodeJS.LTS -e --silent --accept-source-agreements --accept-package-agreements
-    Refresh-Path
-    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-        Die 'Node install completed but `node` is still not on PATH. Open a new PowerShell and re-run.'
-    }
-} else {
-    Say "Node already present: $((node -v))"
-}
-
-# ---------------------------------------------------------------------------
-# 1b. Git (required by Claude Code for anything git-backed)
-# ---------------------------------------------------------------------------
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Say 'Installing Git via winget'
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Die 'winget is not available. Install App Installer from the Microsoft Store, then re-run this script.'
-    }
-    winget install --id Git.Git -e --silent --accept-source-agreements --accept-package-agreements
-    Refresh-Path
-    Say 'Git Bash installed - you may need to restart your terminal before running claude'
-} else {
-    Say "Git already present: $((git --version))"
-}
-
-# ---------------------------------------------------------------------------
-# 2. Claude Code CLI
-# ---------------------------------------------------------------------------
-if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
-    Say 'Installing Claude Code CLI globally via npm'
-    npm install -g '@anthropic-ai/claude-code'
-    Refresh-Path
-
-    # npm global bin on Windows lives at %APPDATA%\npm — make sure it is on PATH
-    $NpmBin = Join-Path $env:APPDATA 'npm'
-    if ((Test-Path $NpmBin) -and (-not ($env:Path -split ';' | Where-Object { $_ -ieq $NpmBin }))) {
-        $env:Path = "$NpmBin;$env:Path"
-        $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
-        if (-not ($userPath -split ';' | Where-Object { $_ -ieq $NpmBin })) {
-            [System.Environment]::SetEnvironmentVariable('Path', "$NpmBin;$userPath", 'User')
-        }
-    }
-} else {
-    Say 'Claude Code CLI already present'
-}
-
-# ---------------------------------------------------------------------------
-# 3. Bridge code + deps
-# ---------------------------------------------------------------------------
-if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallDir | Out-Null }
-
-Say "Downloading bridge/index.js into $InstallDir"
-Invoke-WebRequest -UseBasicParsing -Uri "$RepoRaw/bridge/index.js" -OutFile (Join-Path $InstallDir 'index.js')
-
-$Pkg = Join-Path $InstallDir 'package.json'
-if (-not (Test-Path $Pkg)) {
-    @'
-{
-  "name": "agent-bridge",
-  "version": "1.0.0",
-  "private": true,
-  "main": "index.js",
-  "type": "commonjs"
-}
-'@ | Set-Content -Path $Pkg -Encoding utf8
-}
-
-Say 'Installing express + ws'
-Push-Location $InstallDir
-try {
-    npm install --no-audit --no-fund express ws
-} finally {
-    Pop-Location
-}
-
-# ---------------------------------------------------------------------------
-# 4. Merge defaultMode=bypassPermissions into %USERPROFILE%\.claude\settings.json
-# ---------------------------------------------------------------------------
-if (-not (Test-Path $SettingsDir)) { New-Item -ItemType Directory -Path $SettingsDir | Out-Null }
-
-Say "Ensuring defaultMode=bypassPermissions in $Settings"
-
-$cfg = @{}
-if (Test-Path $Settings) {
-    $raw = Get-Content -Raw -Path $Settings
-    if ($raw -and $raw.Trim().Length -gt 0) {
-        try {
-            $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
-            # Convert PSCustomObject -> hashtable so we can safely set a key
-            $cfg = @{}
-            foreach ($prop in $parsed.PSObject.Properties) { $cfg[$prop.Name] = $prop.Value }
-        } catch {
-            Say "settings.json unreadable, starting fresh: $_"
-            $cfg = @{}
-        }
-    }
-}
-
-if ($cfg['defaultMode'] -ne 'bypassPermissions') {
-    $cfg['defaultMode'] = 'bypassPermissions'
-    ($cfg | ConvertTo-Json -Depth 20) | Set-Content -Path $Settings -Encoding utf8
-    Say 'defaultMode set to bypassPermissions'
-} else {
-    Say 'defaultMode already bypassPermissions'
-}
-
-# ---------------------------------------------------------------------------
-# 5. pm2 up + save
-# ---------------------------------------------------------------------------
-if (-not (Get-Command pm2 -ErrorAction SilentlyContinue)) {
-    Say 'Installing pm2 globally'
-    npm install -g pm2
-    Refresh-Path
-}
-
-Say "Starting bridge under pm2 as '$Pm2Name'"
-# pm2 delete exits non-zero when the process does not exist. Under
-# $ErrorActionPreference='Stop' that would terminate the script, so we
-# hard-swallow it with try/catch — "nothing to delete" is the expected
-# first-run state.
-try {
-    & pm2 delete $Pm2Name *>&1 | Out-Null
-} catch {
-    # Nothing to delete, or pm2 shim complained — either way, fine.
-}
-$global:LASTEXITCODE = 0
-
-# Write an ecosystem.config.js so CLAUDE_PATH (%APPDATA%\npm\claude.cmd)
-# is baked into the pm2 app definition. Using `pm2 start index.js` would
-# rely on the parent shell's env, which pm2 resurrect after a reboot
-# would not see. The ecosystem file is what pm2 save serializes.
-$ClaudeCmd     = Join-Path $env:APPDATA 'npm\claude.cmd'
-$EcosystemPath = Join-Path $InstallDir 'ecosystem.config.js'
-$IndexJsEsc    = ((Join-Path $InstallDir 'index.js') -replace '\\','\\')
-$InstallDirEsc = ($InstallDir -replace '\\','\\')
-$ClaudeCmdEsc  = ($ClaudeCmd   -replace '\\','\\')
-
-$ecosystem = @"
-module.exports = {
-  apps: [{
-    name: '$Pm2Name',
-    script: '$IndexJsEsc',
-    cwd: '$InstallDirEsc',
-    env: {
-      CLAUDE_PATH: '$ClaudeCmdEsc',
-      // The Windows claude.cmd shim via cmd.exe often fails to relay
-      // stdout back to Node during the one-shot auth probe, producing
-      // false "unparseable output" errors even when claude is
-      // authenticated. Skip the probe and let the persistent session
-      // surface any real auth failure directly.
-      SKIP_AUTH_CHECK: '1'
-    }
-  }]
-};
-"@
-Set-Content -Path $EcosystemPath -Value $ecosystem -Encoding utf8
-Say "Wrote $EcosystemPath (CLAUDE_PATH baked in)"
-
-& pm2 start $EcosystemPath
-& pm2 save
-
-# ---------------------------------------------------------------------------
-# 6. Task Scheduler — run `pm2 resurrect` at login
-# ---------------------------------------------------------------------------
-Say "Registering scheduled task '$TaskName' to run pm2 resurrect at login"
-$Pm2Cmd = (Get-Command pm2 -ErrorAction SilentlyContinue).Source
-if (-not $Pm2Cmd) { $Pm2Cmd = Join-Path $env:APPDATA 'npm\pm2.cmd' }
-
-# schtasks is the most reliable across Windows editions; remove any previous
-# copy first. /delete exits non-zero when the task does not exist — swallow it
-# with try/catch so a fresh install does not abort here.
-try {
-    & schtasks /delete /tn $TaskName /f *>&1 | Out-Null
-} catch { }
-$global:LASTEXITCODE = 0
-schtasks /create /tn $TaskName /tr "`"$Pm2Cmd`" resurrect" /sc ONLOGON /rl LIMITED /f | Out-Null
-
-# ---------------------------------------------------------------------------
-# 7. Final instructions
-# ---------------------------------------------------------------------------
-$TsIp = $null
-if (Get-Command tailscale -ErrorAction SilentlyContinue) {
+function Test-WSLInstalled {
+    # wsl --list --quiet returns distro names (often UTF-16LE with NULs on
+    # older WSL builds), exit 0 if any are installed. Normalize aggressively.
     try {
-        $TsIp = (& tailscale ip -4 2>$null | Select-Object -First 1).Trim()
-    } catch { $TsIp = $null }
+        $raw = (wsl --list --quiet 2>$null) -join "`n"
+        if (-not $raw) { return $false }
+        $clean = ($raw -replace "`0","").Trim()
+        return ($clean -match '(?im)^\s*' + [regex]::Escape($Distro) + '\s*$')
+    } catch {
+        return $false
+    }
 }
+
+# ---------------------------------------------------------------------------
+# Phase A: install WSL Ubuntu if needed, then ask user to restart + re-run.
+# ---------------------------------------------------------------------------
+if (-not (Test-WSLInstalled)) {
+    Say "WSL $Distro not installed. Installing now — this typically needs a reboot."
+    if (-not (Test-Admin)) {
+        Warn "wsl --install requires admin. Relaunching this script elevated..."
+        $argList = "-NoProfile -ExecutionPolicy Bypass -Command `"irm $($MyInvocation.MyCommand.Path -replace '\\','/') | iex`""
+        # When piped via `irm | iex` the script has no path on disk, so the
+        # cleanest relaunch is to re-fetch from GitHub.
+        $argList = "-NoProfile -ExecutionPolicy Bypass -Command `"irm https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main/install-windows.ps1 | iex`""
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs
+        exit 0
+    }
+
+    wsl --install -d $Distro
+    Write-Host ''
+    Say 'WSL install triggered.'
+    Say '1. Restart Windows when prompted.'
+    Say '2. After restart, Ubuntu will open and ask you to create a username/password.'
+    Say '3. Complete that, then re-run this installer:'
+    Write-Host ''
+    Write-Host '     powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main/install-windows.ps1 | iex"' -ForegroundColor Green
+    Write-Host ''
+    exit 0
+}
+
+Say "WSL $Distro detected. Proceeding with bridge install inside WSL."
+
+# ---------------------------------------------------------------------------
+# Phase B: run the Linux install.sh inside WSL Ubuntu.
+# ---------------------------------------------------------------------------
+Say 'Running Linux install script inside WSL Ubuntu (this takes a few minutes)...'
+wsl -d $Distro -- bash -lc "curl -fsSL $InstallShUrl | bash"
+if ($LASTEXITCODE -ne 0) {
+    Die "install.sh inside WSL $Distro exited with code $LASTEXITCODE. Check WSL output above."
+}
+
+# ---------------------------------------------------------------------------
+# Phase C: resolve the WSL IP. hostname -I returns space-separated v4 addrs;
+#          the first is the WSL eth0 address reachable from Windows host.
+# ---------------------------------------------------------------------------
+$WslIp = (wsl -d $Distro -- bash -lc 'hostname -I 2>/dev/null').Trim().Split(' ')[0]
+if (-not $WslIp) {
+    Die "Could not resolve WSL $Distro IP via hostname -I."
+}
+Say "WSL IP: $WslIp"
+
+# ---------------------------------------------------------------------------
+# Phase D: ensure we are admin before netsh / schtasks. Self-elevate if not.
+# ---------------------------------------------------------------------------
+if (-not (Test-Admin)) {
+    Warn 'Port forwarding + firewall need admin. Relaunching this script elevated...'
+    $argList = "-NoProfile -ExecutionPolicy Bypass -Command `"irm https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main/install-windows.ps1 | iex`""
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Phase E: netsh portproxy + firewall rule.
+# ---------------------------------------------------------------------------
+Say "Setting up Windows -> WSL port forward on :$BridgePort"
+
+try { & netsh interface portproxy delete v4tov4 listenport=$BridgePort listenaddress=0.0.0.0 *>&1 | Out-Null } catch { }
+$global:LASTEXITCODE = 0
+
+& netsh interface portproxy add v4tov4 listenport=$BridgePort listenaddress=0.0.0.0 connectport=$BridgePort connectaddress=$WslIp | Out-Null
+if ($LASTEXITCODE -ne 0) { Die "netsh portproxy add failed (exit $LASTEXITCODE)" }
+
+try { & netsh advfirewall firewall delete rule name="$FirewallRule" *>&1 | Out-Null } catch { }
+$global:LASTEXITCODE = 0
+& netsh advfirewall firewall add rule name="$FirewallRule" dir=in action=allow protocol=TCP localport=$BridgePort | Out-Null
+if ($LASTEXITCODE -ne 0) { Warn "Firewall rule add returned $LASTEXITCODE — connections from other hosts may be blocked." }
+
+# ---------------------------------------------------------------------------
+# Phase F: scheduled task to re-apply portproxy at every logon.
+#          WSL's IP changes across reboots, so the task runs a small PS
+#          one-liner that re-reads hostname -I and rewrites the proxy.
+# ---------------------------------------------------------------------------
+Say "Registering scheduled task '$TaskName' (re-applies port forward at login)"
+
+$ReapplyScript = @"
+`$ip = (wsl -d $Distro -- bash -lc 'hostname -I 2>/dev/null').Trim().Split(' ')[0]
+if (`$ip) {
+    netsh interface portproxy delete v4tov4 listenport=$BridgePort listenaddress=0.0.0.0 2>`$null | Out-Null
+    netsh interface portproxy add v4tov4 listenport=$BridgePort listenaddress=0.0.0.0 connectport=$BridgePort connectaddress=`$ip | Out-Null
+}
+"@
+$ReapplyPath = Join-Path $env:ProgramData 'agent-bridge\reapply-portproxy.ps1'
+New-Item -ItemType Directory -Path (Split-Path $ReapplyPath) -Force | Out-Null
+Set-Content -Path $ReapplyPath -Value $ReapplyScript -Encoding utf8
+
+try { & schtasks /delete /tn $TaskName /f *>&1 | Out-Null } catch { }
+$global:LASTEXITCODE = 0
+
+$TaskCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$ReapplyPath`""
+& schtasks /create /tn $TaskName /tr $TaskCmd /sc ONLOGON /rl HIGHEST /f | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Warn "schtasks /create returned $LASTEXITCODE — port forward may not persist across reboots until you re-run this script."
+}
+
+# ---------------------------------------------------------------------------
+# Phase G: final instructions.
+# ---------------------------------------------------------------------------
+# Prefer the tailscale IP from inside WSL if the client has it installed,
+# otherwise hand back the Windows-reachable bridge URL via the host IP.
+$TsIp = ''
+try {
+    $TsIp = (wsl -d $Distro -- bash -lc 'tailscale ip -4 2>/dev/null | head -n1').Trim()
+} catch { $TsIp = '' }
 
 Write-Host ''
+Write-Host '────────────────────────────────────────────────────────────' -ForegroundColor DarkGray
+Write-Host '✅ Agent bridge is live on port 3456 (Windows -> WSL Ubuntu)' -ForegroundColor Green
+Write-Host ''
 if ($TsIp) {
-    Write-Host '✅ Agent bridge is live on port 3456' -ForegroundColor Green
-    Write-Host ''
-    Write-Host "Bridge URL: ws://${TsIp}:3456"
+    Write-Host "Bridge URL:  ws://${TsIp}:3456"
     Write-Host 'Enter this in your BE-Agent app to connect.'
-    Write-Host ''
-    Write-Host 'Next step: open a new terminal and run: claude'
-    Write-Host 'Complete the browser login when it opens.'
 } else {
-    Write-Host '✅ Agent bridge is live on port 3456' -ForegroundColor Green
-    Write-Host ''
-    Write-Host 'Install Tailscale at tailscale.com then run: tailscale ip -4 to get your bridge URL.'
-    Write-Host ''
-    Write-Host 'Next step: open a new terminal and run: claude'
-    Write-Host 'Complete the browser login when it opens.'
+    Write-Host 'Bridge URL:  ws://<tailscale-ip>:3456'
+    Write-Host 'Install Tailscale inside WSL (https://tailscale.com) then run'
+    Write-Host '  wsl -d Ubuntu -- tailscale ip -4'
+    Write-Host 'to get your bridge URL.'
 }
+Write-Host ''
+Write-Host 'Next steps:'
+Write-Host '  1. Open Ubuntu from the Start menu.'
+Write-Host '  2. Run:  claude'
+Write-Host '     Complete the browser login when it opens.'
+Write-Host '  3. After any Windows restart, open Ubuntu and run:'
+Write-Host '       source ~/.bashrc && pm2 resurrect'
+Write-Host '     (the port forward reapplies automatically at login).'
+Write-Host '────────────────────────────────────────────────────────────' -ForegroundColor DarkGray
 Write-Host ''

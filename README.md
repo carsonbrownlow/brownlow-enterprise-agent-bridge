@@ -14,23 +14,40 @@ token-level deltas, heartbeats, and health info.
 curl -fsSL https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main/install.sh | bash
 ```
 
-### Windows
+### Windows (runs inside WSL2 Ubuntu)
+
+Claude Code's stream-json protocol isn't supported natively on Windows,
+so the Windows installer sets up WSL2 Ubuntu, runs the Linux installer
+inside it, and port-forwards `0.0.0.0:3456` on the Windows host to the
+bridge running in WSL.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main/install-windows.ps1 | iex"
 ```
 
-After install, authenticate Claude Code:
+First run will install WSL Ubuntu and prompt for a restart; re-run the
+same one-liner after the reboot and Ubuntu setup completes.
+
+After install, open Ubuntu from the Start menu and authenticate:
 
 ```bash
 claude
 ```
 
-Then restart the bridge so it picks up the creds:
+Then restart the bridge:
 
 ```bash
 pm2 restart agent-bridge
 ```
+
+After any Windows restart, open Ubuntu and run:
+
+```bash
+source ~/.bashrc && pm2 resurrect
+```
+
+The Windows-side port forward reapplies automatically at login via a
+scheduled task.
 
 ## Configuration
 
