@@ -2,6 +2,7 @@
 #
 # Does exactly this, in order:
 #   1. Install Node.js LTS via winget if not present
+#   1b. Install Git (Git Bash) via winget if not present
 #   2. Install Claude Code CLI via `npm install -g @anthropic-ai/claude-code`
 #   3. Download bridge/index.js to %USERPROFILE%\agent-bridge and install express + ws
 #   4. Merge defaultMode=bypassPermissions into %USERPROFILE%\.claude\settings.json
@@ -67,6 +68,21 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
     }
 } else {
     Say "Node already present: $((node -v))"
+}
+
+# ---------------------------------------------------------------------------
+# 1b. Git (required by Claude Code for anything git-backed)
+# ---------------------------------------------------------------------------
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Say 'Installing Git via winget'
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Die 'winget is not available. Install App Installer from the Microsoft Store, then re-run this script.'
+    }
+    winget install --id Git.Git -e --silent --accept-source-agreements --accept-package-agreements
+    Refresh-Path
+    Say 'Git Bash installed - you may need to restart your terminal before running claude'
+} else {
+    Say "Git already present: $((git --version))"
 }
 
 # ---------------------------------------------------------------------------
