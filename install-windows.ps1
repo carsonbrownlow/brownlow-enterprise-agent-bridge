@@ -30,6 +30,17 @@ function Refresh-Path {
     $env:Path = "$machine;$user"
 }
 
+# Run a native command and swallow any non-zero exit / stderr noise.
+# Used for pm2 delete and schtasks /delete where "not found" is fine.
+function Invoke-IgnoreFail {
+    param([scriptblock]$Script)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try { & $Script 2>&1 | Out-Null } catch { }
+    $global:LASTEXITCODE = 0
+    $ErrorActionPreference = $prev
+}
+
 # ---------------------------------------------------------------------------
 # 1. Node.js LTS
 # ---------------------------------------------------------------------------
@@ -138,7 +149,10 @@ if (-not (Get-Command pm2 -ErrorAction SilentlyContinue)) {
 }
 
 Say "Starting bridge under pm2 as '$Pm2Name'"
-& pm2 delete $Pm2Name 2>$null | Out-Null
+# pm2 delete exits non-zero when the process does not exist. Under
+# $ErrorActionPreference='Stop' that would terminate the script, so we
+# swallow it — "nothing to delete" is the expected first-run state.
+Invoke-IgnoreFail { pm2 delete $Pm2Name }
 & pm2 start (Join-Path $InstallDir 'index.js') --name $Pm2Name --cwd $InstallDir
 & pm2 save
 
@@ -149,8 +163,9 @@ Say "Registering scheduled task '$TaskName' to run pm2 resurrect at login"
 $Pm2Cmd = (Get-Command pm2 -ErrorAction SilentlyContinue).Source
 if (-not $Pm2Cmd) { $Pm2Cmd = Join-Path $env:APPDATA 'npm\pm2.cmd' }
 
-# schtasks is the most reliable across Windows editions; remove any previous copy first.
-schtasks /delete /tn $TaskName /f 2>$null | Out-Null
+# schtasks is the most reliable across Windows editions; remove any previous
+# copy first. /delete exits non-zero when the task does not exist — swallow it.
+Invoke-IgnoreFail { schtasks /delete /tn $TaskName /f }
 schtasks /create /tn $TaskName /tr "`"$Pm2Cmd`" resurrect" /sc ONLOGON /rl LIMITED /f | Out-Null
 
 # ---------------------------------------------------------------------------
