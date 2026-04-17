@@ -8,8 +8,16 @@ token-level deltas, heartbeats, and health info.
 
 ## Install
 
+### macOS
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main/install.sh | bash
+```
+
+### Windows
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main/install-windows.ps1 | iex"
 ```
 
 After install, authenticate Claude Code:
