@@ -14,6 +14,17 @@
 
 $ErrorActionPreference = 'Stop'
 
+# Set execution policy for the current user so npm-shim .ps1 wrappers
+# (pm2.ps1, claude.ps1, etc.) are allowed to run. Without this, pm2 and
+# other globally-installed tools fail with "running scripts is disabled
+# on this system" on machines that still have the default Restricted
+# policy. CurrentUser scope does not require admin.
+try {
+    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+} catch {
+    Write-Host "[agent-bridge] WARN: could not set execution policy: $_" -ForegroundColor Yellow
+}
+
 $RepoRaw     = 'https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main'
 $InstallDir  = Join-Path $env:USERPROFILE 'agent-bridge'
 $Pm2Name     = 'agent-bridge'
@@ -151,8 +162,14 @@ if (-not (Get-Command pm2 -ErrorAction SilentlyContinue)) {
 Say "Starting bridge under pm2 as '$Pm2Name'"
 # pm2 delete exits non-zero when the process does not exist. Under
 # $ErrorActionPreference='Stop' that would terminate the script, so we
-# swallow it — "nothing to delete" is the expected first-run state.
-Invoke-IgnoreFail { pm2 delete $Pm2Name }
+# hard-swallow it with try/catch — "nothing to delete" is the expected
+# first-run state.
+try {
+    & pm2 delete $Pm2Name *>&1 | Out-Null
+} catch {
+    # Nothing to delete, or pm2 shim complained — either way, fine.
+}
+$global:LASTEXITCODE = 0
 & pm2 start (Join-Path $InstallDir 'index.js') --name $Pm2Name --cwd $InstallDir
 & pm2 save
 
@@ -164,8 +181,12 @@ $Pm2Cmd = (Get-Command pm2 -ErrorAction SilentlyContinue).Source
 if (-not $Pm2Cmd) { $Pm2Cmd = Join-Path $env:APPDATA 'npm\pm2.cmd' }
 
 # schtasks is the most reliable across Windows editions; remove any previous
-# copy first. /delete exits non-zero when the task does not exist — swallow it.
-Invoke-IgnoreFail { schtasks /delete /tn $TaskName /f }
+# copy first. /delete exits non-zero when the task does not exist — swallow it
+# with try/catch so a fresh install does not abort here.
+try {
+    & schtasks /delete /tn $TaskName /f *>&1 | Out-Null
+} catch { }
+$global:LASTEXITCODE = 0
 schtasks /create /tn $TaskName /tr "`"$Pm2Cmd`" resurrect" /sc ONLOGON /rl LIMITED /f | Out-Null
 
 # ---------------------------------------------------------------------------
