@@ -205,7 +205,13 @@ module.exports = {
     script: '$IndexJsEsc',
     cwd: '$InstallDirEsc',
     env: {
-      CLAUDE_PATH: '$ClaudeCmdEsc'
+      CLAUDE_PATH: '$ClaudeCmdEsc',
+      // The Windows claude.cmd shim via cmd.exe often fails to relay
+      // stdout back to Node during the one-shot auth probe, producing
+      // false "unparseable output" errors even when claude is
+      // authenticated. Skip the probe and let the persistent session
+      // surface any real auth failure directly.
+      SKIP_AUTH_CHECK: '1'
     }
   }]
 };

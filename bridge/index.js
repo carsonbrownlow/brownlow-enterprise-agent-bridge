@@ -254,27 +254,59 @@ function runAuthCheck(cb) {
     cwd: CLAUDE_CWD,
     shell: IS_WINDOWS, // required so Node can invoke claude.cmd on Windows
   });
-  let out = '';
-  t.stdout.on('data', (d) => { out += d.toString(); });
-  t.on('error', (err) => { state.authOk = false; state.lastError = `auth-check spawn: ${err.message}`; logErr('auth check spawn failed', err.message); cb(); });
-  t.on('close', () => {
-    let parsed;
-    try { parsed = JSON.parse(out); } catch { parsed = null; }
-    if (!parsed) {
-      state.authOk = false;
-      state.lastError = 'auth check produced unparseable output';
-      logErr('auth check output unparseable:', out.slice(0, 200));
-    } else if (parsed.is_error && /not logged in/i.test(parsed.result || '')) {
+
+  // Collect stdout and stderr as raw Buffers so we can inspect exact bytes
+  // on Windows, where cmd.exe wrappers have been observed to add \r\n and
+  // the shim occasionally reorders streams.
+  const stdoutChunks = [];
+  const stderrChunks = [];
+  t.stdout.on('data', (d) => stdoutChunks.push(d));
+  t.stderr.on('data', (d) => stderrChunks.push(d));
+
+  t.on('error', (err) => {
+    state.authOk = false;
+    state.lastError = `auth-check spawn: ${err.message}`;
+    logErr('auth check spawn failed', err.message);
+    cb();
+  });
+
+  t.on('close', (code) => {
+    const outBuf = Buffer.concat(stdoutChunks);
+    const errBuf = Buffer.concat(stderrChunks);
+    // Strip UTF-8 BOM if present, then trim CR/LF.
+    let out = outBuf.toString('utf8');
+    if (out.charCodeAt(0) === 0xFEFF) out = out.slice(1);
+    out = out.trim();
+
+    log(`auth check: exit=${code} stdout_bytes=${outBuf.length} stderr_bytes=${errBuf.length}`);
+    if (outBuf.length) log('auth check stdout preview:', out.slice(0, 200));
+    if (errBuf.length) log('auth check stderr preview:', errBuf.toString('utf8').slice(0, 200));
+
+    let parsed = null;
+    if (out.length) {
+      try { parsed = JSON.parse(out); } catch { parsed = null; }
+    }
+
+    if (parsed && parsed.is_error && /not logged in/i.test(parsed.result || '')) {
       state.authOk = false;
       state.lastError = 'Claude not authenticated';
       logErr('BRIDGE: Claude not authenticated — run `claude` interactively to log in, then restart the bridge (pm2 restart agent-bridge).');
-    } else if (parsed.is_error) {
+    } else if (parsed && parsed.is_error) {
       state.authOk = false;
       state.lastError = `auth check error: ${parsed.result}`;
       logErr('auth check error:', parsed.result);
-    } else {
+    } else if (parsed) {
       state.authOk = true;
       log('auth check passed');
+    } else if (code === 0) {
+      // Exit 0 but we couldn't capture / parse the JSON (common on Windows
+      // with shell:true). The CLI exited cleanly — trust that and proceed.
+      state.authOk = true;
+      log('auth check: empty/unparseable stdout but exit=0 — treating as authenticated');
+    } else {
+      state.authOk = false;
+      state.lastError = `auth check produced unparseable output (exit=${code}, stdout_bytes=${outBuf.length})`;
+      logErr('auth check output unparseable:', out.slice(0, 200) || '(empty)');
     }
     cb();
   });
@@ -402,6 +434,20 @@ server.listen(PORT, '0.0.0.0', () => {
   log(`agent bridge listening on 0.0.0.0:${PORT} (http + ws)`);
   log(`claude binary: ${CLAUDE_PATH}`);
   log(`cwd for claude sessions: ${CLAUDE_CWD}`);
+
+  // On Windows, the claude.cmd shim via cmd.exe sometimes fails to relay
+  // stdout back to Node even though the CLI ran fine. Setting
+  // SKIP_AUTH_CHECK=1 (the Windows installer does this in ecosystem.config.js)
+  // bypasses the probe and lets the persistent session start directly. If
+  // claude isn't actually authenticated the spawned session will exit with
+  // a clear error on its own.
+  if (process.env.SKIP_AUTH_CHECK && process.env.SKIP_AUTH_CHECK !== '0') {
+    log('SKIP_AUTH_CHECK set — bypassing auth probe, starting session directly');
+    state.authOk = true;
+    startClaude();
+    return;
+  }
+
   runAuthCheck(() => {
     if (state.authOk) {
       startClaude();
