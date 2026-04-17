@@ -6,7 +6,8 @@
 #   2. Install Claude Code CLI via `npm install -g @anthropic-ai/claude-code`
 #   3. Download bridge/index.js to %USERPROFILE%\agent-bridge and install express + ws
 #   4. Merge defaultMode=bypassPermissions into %USERPROFILE%\.claude\settings.json
-#   5. Start the bridge under pm2 as 'agent-bridge' and save
+#   5. Write ecosystem.config.js (with CLAUDE_PATH baked in) and start the
+#      bridge under pm2 as 'agent-bridge', then pm2 save
 #   6. Register a Task Scheduler task that runs `pm2 resurrect` at login
 #   7. Print the Tailscale bridge URL and next-step instructions
 #
@@ -186,7 +187,33 @@ try {
     # Nothing to delete, or pm2 shim complained — either way, fine.
 }
 $global:LASTEXITCODE = 0
-& pm2 start (Join-Path $InstallDir 'index.js') --name $Pm2Name --cwd $InstallDir
+
+# Write an ecosystem.config.js so CLAUDE_PATH (%APPDATA%\npm\claude.cmd)
+# is baked into the pm2 app definition. Using `pm2 start index.js` would
+# rely on the parent shell's env, which pm2 resurrect after a reboot
+# would not see. The ecosystem file is what pm2 save serializes.
+$ClaudeCmd     = Join-Path $env:APPDATA 'npm\claude.cmd'
+$EcosystemPath = Join-Path $InstallDir 'ecosystem.config.js'
+$IndexJsEsc    = ((Join-Path $InstallDir 'index.js') -replace '\\','\\')
+$InstallDirEsc = ($InstallDir -replace '\\','\\')
+$ClaudeCmdEsc  = ($ClaudeCmd   -replace '\\','\\')
+
+$ecosystem = @"
+module.exports = {
+  apps: [{
+    name: '$Pm2Name',
+    script: '$IndexJsEsc',
+    cwd: '$InstallDirEsc',
+    env: {
+      CLAUDE_PATH: '$ClaudeCmdEsc'
+    }
+  }]
+};
+"@
+Set-Content -Path $EcosystemPath -Value $ecosystem -Encoding utf8
+Say "Wrote $EcosystemPath (CLAUDE_PATH baked in)"
+
+& pm2 start $EcosystemPath
 & pm2 save
 
 # ---------------------------------------------------------------------------

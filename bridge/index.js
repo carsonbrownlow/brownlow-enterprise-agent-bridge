@@ -7,6 +7,10 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const HOME = os.homedir();
+// On Windows, node.spawn() cannot execute .cmd / .bat shims (claude.cmd,
+// pm2.cmd, etc.) directly — it errors with EINVAL. Passing shell:true
+// routes the call through cmd.exe which knows how to resolve the shim.
+const IS_WINDOWS = process.platform === 'win32';
 
 function resolveClaudePath() {
   if (process.env.CLAUDE_PATH) return process.env.CLAUDE_PATH;
@@ -154,6 +158,7 @@ function startClaude() {
     env: childEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
     cwd: CLAUDE_CWD,
+    shell: IS_WINDOWS, // required so Node can invoke claude.cmd on Windows
   });
 
   state.proc = proc;
@@ -247,6 +252,7 @@ function runAuthCheck(cb) {
     env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
     cwd: CLAUDE_CWD,
+    shell: IS_WINDOWS, // required so Node can invoke claude.cmd on Windows
   });
   let out = '';
   t.stdout.on('data', (d) => { out += d.toString(); });
