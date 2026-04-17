@@ -1,78 +1,199 @@
 #!/usr/bin/env bash
 #
-# Brownlow Enterprise — Agent Bridge installer
+# Brownlow Enterprise — Agent Bridge installer (macOS)
 #
-# Installs the bridge server into ~/agent-bridge, boots it under pm2, and
-# registers it for auto-start on login.
+# Does exactly this, in order:
+#   1. Installs NVM + Node if not present
+#   2. Installs Claude Code CLI if not present
+#   3. Downloads bridge/index.js into ~/agent-bridge and installs express + ws
+#   4. Ensures ~/.claude/settings.json has defaultMode=bypassPermissions (merged,
+#      not overwritten)
+#   5. Starts the bridge under pm2 as 'agent-bridge' and saves the pm2 state
+#   6. Installs a launchd plist so the bridge resurrects on boot
+#   7. Prints the bridge URL (tailscale ip -4), the claude auth reminder, and
+#      the BE-Agent app instructions
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main/install.sh | bash
-#
-# After install, authenticate Claude Code once:
-#   claude
-#
-# Then restart the bridge so it picks up the creds:
-#   pm2 restart agent-bridge
 
 set -euo pipefail
 
 REPO_RAW="https://raw.githubusercontent.com/carsonbrownlow/brownlow-enterprise-agent-bridge/main"
-INSTALL_DIR="${AGENT_BRIDGE_DIR:-$HOME/agent-bridge}"
-BRIDGE_DIR="$INSTALL_DIR/bridge"
-PM2_NAME="${PM2_NAME:-agent-bridge}"
+INSTALL_DIR="$HOME/agent-bridge"
+PM2_NAME="agent-bridge"
+PLIST_LABEL="com.brownlow.agent-bridge"
+PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+NVM_DIR="$HOME/.nvm"
 
-say()  { printf "\033[1;34m[agent-bridge]\033[0m %s\n" "$*"; }
-die()  { printf "\033[1;31m[agent-bridge]\033[0m %s\n" "$*" >&2; exit 1; }
+say() { printf "\033[1;34m[agent-bridge]\033[0m %s\n" "$*"; }
 
-say "Target install dir: $INSTALL_DIR"
-
-command -v node >/dev/null 2>&1 || die "node is required. Install Node 18+ (e.g. via nvm or 'brew install node') and re-run."
-command -v npm  >/dev/null 2>&1 || die "npm is required."
-
-NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]")
-if [ "$NODE_MAJOR" -lt 18 ]; then
-  die "Node $NODE_MAJOR detected. Need Node 18 or newer."
+# ---------------------------------------------------------------------------
+# 1. NVM + Node
+# ---------------------------------------------------------------------------
+if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+  say "Installing NVM"
+  curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
 fi
 
+# shellcheck disable=SC1091
+export NVM_DIR="$NVM_DIR"
+. "$NVM_DIR/nvm.sh"
+
+if ! command -v node >/dev/null 2>&1; then
+  say "Installing Node LTS via NVM"
+  nvm install --lts
+  nvm alias default 'lts/*'
+fi
+nvm use default >/dev/null
+
+# ---------------------------------------------------------------------------
+# 2. Claude Code CLI
+# ---------------------------------------------------------------------------
 if ! command -v claude >/dev/null 2>&1; then
-  say "WARNING: 'claude' CLI not on PATH. The bridge needs Claude Code installed and authenticated."
-  say "         Install from https://docs.claude.com/en/docs/claude-code then run 'claude' to log in."
+  say "Installing Claude Code CLI"
+  curl -fsSL https://claude.ai/install.sh | bash
+
+  # Ensure ~/.local/bin is on PATH for this and future shells
+  if [ -d "$HOME/.local/bin" ]; then
+    export PATH="$HOME/.local/bin:$PATH"
+    for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
+      if [ -f "$rc" ] && ! grep -q '.local/bin' "$rc" 2>/dev/null; then
+        printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
+      fi
+    done
+  fi
 fi
 
+# ---------------------------------------------------------------------------
+# 3. Bridge code + deps
+# ---------------------------------------------------------------------------
+mkdir -p "$INSTALL_DIR"
+say "Downloading bridge/index.js into $INSTALL_DIR"
+curl -fsSL "$REPO_RAW/bridge/index.js" -o "$INSTALL_DIR/index.js"
+
+cd "$INSTALL_DIR"
+if [ ! -f package.json ]; then
+  cat > package.json <<'PKG'
+{
+  "name": "agent-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "type": "commonjs"
+}
+PKG
+fi
+
+say "Installing express + ws"
+npm install --no-audit --no-fund express ws
+
+# ---------------------------------------------------------------------------
+# 4. Merge defaultMode=bypassPermissions into ~/.claude/settings.json
+# ---------------------------------------------------------------------------
+mkdir -p "$HOME/.claude"
+SETTINGS="$HOME/.claude/settings.json"
+[ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
+
+say "Ensuring defaultMode=bypassPermissions in $SETTINGS"
+node - "$SETTINGS" <<'NODE'
+const fs = require('fs');
+const p = process.argv[2];
+let cfg = {};
+try {
+  const raw = fs.readFileSync(p, 'utf8').trim();
+  if (raw) cfg = JSON.parse(raw);
+} catch (e) {
+  console.error('settings.json unreadable, starting fresh:', e.message);
+  cfg = {};
+}
+if (cfg.defaultMode !== 'bypassPermissions') {
+  cfg.defaultMode = 'bypassPermissions';
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + '\n');
+  console.log('defaultMode set to bypassPermissions');
+} else {
+  console.log('defaultMode already bypassPermissions');
+}
+NODE
+
+# ---------------------------------------------------------------------------
+# 5. pm2 up + save
+# ---------------------------------------------------------------------------
 if ! command -v pm2 >/dev/null 2>&1; then
-  say "Installing pm2 globally"
+  say "Installing pm2"
   npm install -g pm2
 fi
 
-mkdir -p "$BRIDGE_DIR"
-cd "$BRIDGE_DIR"
-
-say "Downloading bridge files"
-curl -fsSL "$REPO_RAW/bridge/index.js"     -o index.js
-curl -fsSL "$REPO_RAW/bridge/package.json" -o package.json
-
-say "Installing dependencies"
-npm install --omit=dev --no-audit --no-fund
-
-say "Starting under pm2 as '$PM2_NAME'"
+say "Starting bridge under pm2 as '$PM2_NAME'"
 pm2 delete "$PM2_NAME" >/dev/null 2>&1 || true
-pm2 start index.js --name "$PM2_NAME" --cwd "$BRIDGE_DIR"
+pm2 start "$INSTALL_DIR/index.js" --name "$PM2_NAME" --cwd "$INSTALL_DIR"
 pm2 save
 
-say "Attempting pm2 auto-start on login (may prompt for sudo)"
-pm2 startup >/dev/null 2>&1 || say "pm2 startup skipped — run 'pm2 startup' manually if you want auto-start on login."
+# ---------------------------------------------------------------------------
+# 6. launchd plist for boot persistence
+# ---------------------------------------------------------------------------
+say "Installing launchd plist at $PLIST_PATH"
+mkdir -p "$HOME/Library/LaunchAgents"
 
-PORT="${PORT:-3456}"
-sleep 1
-if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-  say "Bridge is up at http://127.0.0.1:$PORT  (health endpoint OK)"
+NODE_BIN="$(command -v node)"
+NODE_BIN_DIR="$(dirname "$NODE_BIN")"
+PM2_BIN="$(command -v pm2)"
+
+cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${PLIST_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${PM2_BIN}</string>
+    <string>resurrect</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${NODE_BIN_DIR}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>${HOME}</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>${INSTALL_DIR}/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>${INSTALL_DIR}/launchd.err.log</string>
+</dict>
+</plist>
+PLIST
+
+launchctl unload "$PLIST_PATH" >/dev/null 2>&1 || true
+launchctl load "$PLIST_PATH"
+
+# ---------------------------------------------------------------------------
+# 7. Final instructions
+# ---------------------------------------------------------------------------
+TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+if [ -z "$TS_IP" ]; then
+  BRIDGE_URL="ws://<tailscale-ip>:3456"
+  TS_NOTE="  (Tailscale not detected — run 'tailscale ip -4' on this machine to get the IP.)"
 else
-  say "Bridge started but /health did not respond yet. Check: pm2 logs $PM2_NAME"
+  BRIDGE_URL="ws://${TS_IP}:3456"
+  TS_NOTE=""
 fi
 
-say "Done."
-say ""
-say "Next steps:"
-say "  1. If you haven't already: run 'claude' to authenticate Claude Code."
-say "  2. Restart the bridge so it picks up creds: pm2 restart $PM2_NAME"
-say "  3. Point your client app at: ws://<this-host>:$PORT"
+cat <<EOF
+
+────────────────────────────────────────────────────────────
+ Install complete.
+
+ Bridge URL:  ${BRIDGE_URL}
+${TS_NOTE}
+ Next:
+   1. Run 'claude' once in this terminal to authenticate via browser.
+   2. Open the BE-Agent app and paste the bridge URL above into
+      the connection field.
+────────────────────────────────────────────────────────────
+EOF
