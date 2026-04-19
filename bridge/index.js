@@ -32,6 +32,7 @@ const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '120000', 
 const RESPAWN_DELAY_MS = parseInt(process.env.RESPAWN_DELAY_MS || '2000', 10);
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.HEARTBEAT_INTERVAL_MS || '3000', 10);
 const SENTINEL = process.env.BRIDGE_SENTINEL || '---AGENT_END---';
+const SUMMARY_MARKER = process.env.BRIDGE_SUMMARY_MARKER || '---SUMMARY---';
 const SESSION_LOG_PATH = path.join(__dirname, 'session_logs.jsonl');
 const CLAUDE_CWD = process.env.CLAUDE_CWD || HOME;
 
@@ -100,17 +101,29 @@ function streamTokenFromAssistant(evt) {
   if (!state.inFlight || !state.inFlight.ws) return;
   const content = evt && evt.message && evt.message.content;
   if (!Array.isArray(content)) return;
+  const r = state.inFlight;
   for (const block of content) {
     if (block && block.type === 'text' && typeof block.text === 'string' && block.text.length) {
       const clean = stripSentinel(block.text);
-      const prev = state.inFlight.tokensSeen || '';
+      const prev = r.tokensSeen || '';
       let delta = clean;
       if (clean.startsWith(prev)) delta = clean.slice(prev.length);
-      if (delta) {
-        state.inFlight.tokensSeen = clean;
-        state.inFlight.lastTokenTime = Date.now();
-        wsSend(state.inFlight.ws, { type: 'token', content: delta });
+      if (!delta) continue;
+      r.tokensSeen = clean;
+      r.lastTokenTime = Date.now();
+
+      if (r.summaryMode) {
+        wsSend(r.ws, { type: 'token', content: delta });
+        continue;
       }
+
+      // Marker not yet seen — check the full accumulated text (handles split markers).
+      const markerIdx = clean.indexOf(SUMMARY_MARKER);
+      if (markerIdx === -1) continue; // buffer silently
+
+      r.summaryMode = true;
+      const afterMarker = clean.slice(markerIdx + SUMMARY_MARKER.length);
+      if (afterMarker) wsSend(r.ws, { type: 'token', content: afterMarker });
     }
   }
 }
@@ -138,7 +151,20 @@ function handleClaudeLine(line) {
       finishInFlight({ error: 'claude reported error', detail: evt.result, session_id: state.sessionId }, 502);
     } else {
       const text = stripSentinel(evt.result || '');
-      finishInFlight({ response: text, session_id: state.sessionId });
+      const r = state.inFlight;
+      const markerIdx = text.indexOf(SUMMARY_MARKER);
+      const finalText = markerIdx === -1
+        ? text
+        : text.slice(markerIdx + SUMMARY_MARKER.length).replace(/^\s+/, '');
+
+      // If nothing was streamed yet (marker-first block arrived only in result,
+      // or marker never appeared), emit the final text as a single token so the
+      // client still gets streaming semantics. Fallback rule: no marker → full text.
+      if (!r.summaryMode && r.ws && finalText) {
+        wsSend(r.ws, { type: 'token', content: finalText });
+      }
+
+      finishInFlight({ response: finalText, session_id: state.sessionId });
     }
     processQueue();
   }
